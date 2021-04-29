@@ -1,1 +1,1 @@
-# socsemics--package--dev
+# socsemics-package-dev
