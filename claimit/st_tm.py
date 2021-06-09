@@ -10,6 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoTokenizer, AutoModel
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 
 logger = logging.getLogger('STTopicModel')
@@ -28,7 +29,8 @@ class STTopicModel:
                  token_pattern=r"(?u)\b\w\w+\b",  # Default sklearn pattern
                  verbose=False
                  ):
-        # general parameters
+        # General parameters
+        # TODO: logging
         if verbose:
             logger.setLevel(logging.DEBUG)
             self.verbose = True
@@ -36,35 +38,26 @@ class STTopicModel:
             logger.setLevel(logging.WARNING)
             self.verbose = False
 
-        # store documents
+        # Store documents
         self.documents = np.array(documents, dtype="object")
         if document_ids is not None:
             self.document_ids = np.array(document_ids)
         else:
             self.document_ids = np.array(range(0, len(documents)))
 
-        # preprocess vocabulary
+        # Preprocess vocabulary
         self.token_pattern = token_pattern
         self.vocab = self._preprocess_voc(self.documents, self.token_pattern)
 
-        # initialize embedding variables
+        # Initialize embedding variables
         self.embedding_model = embedding_model
         self.document_vectors = None
 
-        # initialize topic extraction variables
-        self.topic_extraction_parameters = None
-        self.doc_topic = None
-        self.doc_topic_sim = None
-        self.doc_topic_noisy = None
-        self.topic_vectors = None
-        self.topic_vectors_tfidf = None
-        self.topic_sizes = None
-        self.topic_words = None
-
-        # initialize facet extraction variables
-        self.facet_extraction_parameters = None
-        self.doc_topic_facet = None
-        self.topic_facets = None
+        # Initialize topic/facet extraction variables
+        self.topic_facets = {}
+        self.doc_topic_facet = {}
+        self.topic_extraction_parameters = {}
+        self.facet_extraction_parameters = {}
 
     def save(self, file):
         """Save model to file."""
@@ -77,7 +70,7 @@ class STTopicModel:
         return model
 
     def embed_corpus(self, pooling_method="mean", device=None, batch_size=32):
-        """Compute document and vocabulary embeddings using a transfomer model."""
+        """Compute document embeddings using a transfomer model."""
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -91,10 +84,11 @@ class STTopicModel:
 
         # Embed corpus by batches
         batches_embedding = []
-        for __, batch in enumerate(dataloader):
+        for __, batch in tqdm(enumerate(dataloader)):
             # Tokenize documents
             encoded_input = tokenizer(batch, padding=True, truncation=True,
                                       return_tensors='pt')
+            encoded_input = encoded_input.to(device)
             # Compute token embeddings
             with torch.no_grad():
                 model_output = model(**encoded_input)
@@ -124,7 +118,7 @@ class STTopicModel:
 
         return document_vectors
 
-    def topic_extraction(self, n_components, n_neighbors, min_topic_size,
+    def topic_extraction(self, n_components, n_neighbors, min_size,
                          min_samples=None, n_words=30, random_state=None):
         """Extract and characterize high-level topics from the corpus."""
         if self.document_vectors is None:
@@ -139,11 +133,11 @@ class STTopicModel:
 
         # Topic clustering
         hdbscan_model = self._compute_hdbscan(document_vectors_ld,
-                                              min_topic_size,
+                                              min_size,
                                               min_samples,
                                               cluster_selection_method='leaf')
         clusters = hdbscan_model.labels_
-        self.doc_topic_noisy = (clusters == -1)
+        doc_topic_noisy = (clusters == -1)
 
         # Compute topic vectors
         topic_vectors = self._compute_topic_vectors(self.document_vectors,
@@ -153,54 +147,60 @@ class STTopicModel:
         doc_topic, doc_topic_sim = self._assign_noisy_docs(self.document_vectors,
                                                            topic_vectors,
                                                            clusters)
-        self.doc_topic_sim = doc_topic_sim
 
         # Reorder topics by decreasing size
         doc_topic, topic_vectors = self._reorder_topics(doc_topic, topic_vectors)
-        __, topic_sizes = np.unique(doc_topic, return_counts=True)
-        self.doc_topic = doc_topic
-        self.topic_vectors = topic_vectors
-        self.topic_sizes = topic_sizes
 
         # Characterize topics by top N words with highest average TF-IDF
         # among the topic's documents subset
-        topic_words, topic_vectors_tfidf = self._topic_characterization(doc_topic,
-                                                                        subset_docs=None,
-                                                                        n_words=n_words)
-        self.topic_words = topic_words
-        self.topic_vectors_tfidf = topic_vectors_tfidf
+        topic_words, __ = self._topic_characterization(doc_topic,
+                                                       subset_docs=None,
+                                                       n_words=n_words)
+
+        # Store general topic information
+        for topic, t_vector in enumerate(topic_vectors):
+            doc_idxs = np.where(doc_topic == topic)[0]
+            self.topic_facets[topic] = {
+                "doc_idxs": doc_idxs,
+                "size": len(doc_idxs),
+                "vector": t_vector,
+                "words": topic_words[topic],
+                "facets": {}
+            }
+
+        # Store topic information for each document
+        for idx, __ in enumerate(doc_topic):
+            self.doc_topic_facet[idx] = {"topic": doc_topic[idx],
+                                         "topic_similarity": doc_topic_sim[idx],
+                                         "topic_noisy": doc_topic_noisy[idx]
+                                         }
 
         # Store parameters used for topic extraction
         self.topic_extraction_parameters = {
             "n_components": n_components,
             "n_neighbors": n_neighbors,
-            "min_topic_size": min_topic_size,
+            "min_topic_size": min_size,
             "min_samples": min_samples,
             "n_words": n_words,
             "random_state": random_state
         }
 
-        # Clean previously stored facet extraction results
+        # Clean previously stored facet extraction parameters
         self.facet_extraction_parameters = None
-        self.doc_topic_facet = None
-        self.topic_facets = None
 
-        return doc_topic
+        return self.doc_topic_facet, self.topic_facets
 
-    def facet_extraction(self, n_components, n_neighbors, min_facet_size,
+    def facet_extraction(self, n_components, n_neighbors, min_size,
                          min_samples=None, n_words=30, random_state=None):
         """Extract and characterize facets (sub-topics) of each topic."""
-        if self.doc_topic is None:
+        if self.doc_topic_facet == {}:
             raise ValueError("Topic extraction must be performed prior to facet extraction.")
 
-        topics = np.unique(self.doc_topic)
-        topic_facets = {t: {} for t in topics}
-        doc_topic_facet = {d: {} for d in range(len(self.documents))}
-
-        for topic in topics:
+        for topic in self.topic_facets:
 
             # Get topic's document vectors
-            doc_idxs = np.where(self.doc_topic == topic)[0]
+            doc_idxs = [idx for idx in self.doc_topic_facet
+                        if self.doc_topic_facet[idx]["topic"] == topic]
             document_vectors = self.document_vectors[doc_idxs]
             idxs_to_sub_idxs = {idx: i for i, idx in enumerate(doc_idxs)}
             sub_idxs_to_idxs = {i: idx for idx, i in idxs_to_sub_idxs.items()}
@@ -214,7 +214,7 @@ class STTopicModel:
 
             # Facet clustering
             hdbscan_model = self._compute_hdbscan(document_vectors_ld,
-                                                  min_facet_size,
+                                                  min_size,
                                                   min_samples,
                                                   cluster_selection_method='leaf')
             clusters = hdbscan_model.labels_
@@ -231,7 +231,7 @@ class STTopicModel:
 
             # Reorder topics by decreasing size
             doc_facet, facet_vectors = self._reorder_topics(doc_facet, facet_vectors)
-            facets, facet_sizes = np.unique(doc_facet, return_counts=True)
+            __, facet_sizes = np.unique(doc_facet, return_counts=True)
 
             # Characterize facets by top N words with highest average TF-IDF
             # among the facet's documents subset
@@ -240,34 +240,27 @@ class STTopicModel:
                                                            n_words=n_words)
 
             # Store facets information for each topic
-            topic_facets[topic] = {f: {} for f in facets}
             for facet, size in enumerate(facet_sizes):
                 facet_doc_idxs = [sub_idxs_to_idxs[i]
                                   for i in np.where(doc_facet == facet)[0]]
-                topic_facets[topic][facet]["doc_idxs"] = np.array(facet_doc_idxs)
-                topic_facets[topic][facet]["size"] = size
-                topic_facets[topic][facet]["vector"] = facet_vectors[facet]
-                topic_facets[topic][facet]["words"] = facet_words[facet]
+                self.topic_facets[topic]["facets"][facet] = {"doc_idxs": np.array(facet_doc_idxs),
+                                                             "size": size,
+                                                             "vector": facet_vectors[facet],
+                                                             "words": facet_words[facet]
+                                                             }
 
-            # Store topic and facet information for each document
+            # Store facet information for each document
             for idx in doc_idxs:
                 idx_sub = idxs_to_sub_idxs[idx]
-                doc_topic_facet[idx] = {"topic": topic,
-                                        "topic_similarity": self.doc_topic_sim[idx],
-                                        "topic_noisy": self.doc_topic_noisy[idx],
-                                        "facet": doc_facet[idx_sub],
-                                        "facet_similarity": doc_facet_sim[idx_sub],
-                                        "facet_noisy": doc_facet_noisy[idx_sub]
-                                        }
-
-        self.topic_facets = topic_facets
-        self.doc_topic_facet = doc_topic_facet
+                self.doc_topic_facet[idx]["facet"] = doc_facet[idx_sub]
+                self.doc_topic_facet[idx]["facet_similarity"] = doc_facet_sim[idx_sub]
+                self.doc_topic_facet[idx]["facet_noisy"] = doc_facet_noisy[idx_sub]
 
         # Store parameters used for topic extraction
         self.facet_extraction_parameters = {
             "n_components": n_components,
             "n_neighbors": n_neighbors,
-            "min_facet_size": min_facet_size,
+            "min_facet_size": min_size,
             "min_samples": min_samples,
             "n_words": n_words,
             "random_state": random_state
@@ -330,8 +323,9 @@ class STTopicModel:
         probs = hdbscan_model.probabilities_
 
         # Exclude noisy documents from topic vector computation
+        # If all noisy (no clusters), include everything
         unique_labels = np.unique(clusters)
-        if -1 in unique_labels:
+        if len(unique_labels) > 1 and -1 in unique_labels:
             unique_labels = unique_labels[1:]
 
         # Compute topic vectors as average of topic's document vectors,
@@ -339,9 +333,15 @@ class STTopicModel:
         topic_vectors = []
         for topic in unique_labels:
             doc_idxs = np.where(clusters == topic)
-            topic_vec = np.average(document_vectors[doc_idxs],
-                                   weights=probs[doc_idxs],
-                                   axis=0)
+            if all(probs == 0):
+                # All docs noisy case
+                topic_vec = np.average(document_vectors[doc_idxs],
+                                       axis=0)
+            else:
+                # Normal case
+                topic_vec = np.average(document_vectors[doc_idxs],
+                                       weights=probs[doc_idxs],
+                                       axis=0)
             topic_vectors.append(topic_vec)
 
         topic_vectors = np.array(topic_vectors)
