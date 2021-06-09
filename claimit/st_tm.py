@@ -69,6 +69,21 @@ class STTopicModel:
         model = joblib.load(file)
         return model
 
+    def get_attr(self, attr, topic=None, facet=None):
+        """Query topic/facet attributes."""
+        if topic == "all" and facet is None:
+            res = np.array([self.topic_facets[t][attr] for t in self.topic_facets])
+        elif topic in self.topic_facets and facet is None:
+            res = self.topic_facets[topic][attr]
+        elif topic in self.topic_facets and facet == "all":
+            res = np.array([self.topic_facets[topic]["facets"][f][attr]
+                            for f in self.topic_facets[topic]["facets"]])
+        elif topic in self.topic_facets and facet in self.topic_facets[topic]["facets"]:
+            res = self.topic_facets[topic]["facets"][facet][attr]
+        else:
+            raise ValueError("Invalid combination of parameters provided.")
+        return res
+
     def embed_corpus(self, pooling_method="mean", device=None, batch_size=32):
         """Compute document embeddings using a transfomer model."""
         if device is None:
@@ -160,6 +175,7 @@ class STTopicModel:
         # Store general topic information
         for topic, t_vector in enumerate(topic_vectors):
             doc_idxs = np.where(doc_topic == topic)[0]
+            # TODO: replace idxs by doc ids
             self.topic_facets[topic] = {
                 "doc_idxs": doc_idxs,
                 "size": len(doc_idxs),
@@ -241,9 +257,10 @@ class STTopicModel:
 
             # Store facets information for each topic
             for facet, size in enumerate(facet_sizes):
-                facet_doc_idxs = [sub_idxs_to_idxs[i]
-                                  for i in np.where(doc_facet == facet)[0]]
-                self.topic_facets[topic]["facets"][facet] = {"doc_idxs": np.array(facet_doc_idxs),
+                facet_doc_idxs = np.array([sub_idxs_to_idxs[i]
+                                           for i in np.where(doc_facet == facet)[0]])
+                # TODO: replace idxs by doc ids
+                self.topic_facets[topic]["facets"][facet] = {"doc_idxs": facet_doc_idxs,
                                                              "size": size,
                                                              "vector": facet_vectors[facet],
                                                              "words": facet_words[facet]
